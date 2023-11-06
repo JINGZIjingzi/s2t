@@ -188,21 +188,21 @@ def build_optimizer(args, model):
     return optimizer, scheduler
 
 
-def batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_path):
+def batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths):
     instances_num = src_text.size()[0]
     for i in range(instances_num // batch_size):
         src_text_batch = src_text[i * batch_size : (i + 1) * batch_size, :]
         seg_text_batch = seg_text[i * batch_size : (i + 1) * batch_size, :]
         tgt_batch = tgt[i * batch_size : (i + 1) * batch_size, :]
         tgt_seg_batch = tgt_seg[i * batch_size : (i + 1) * batch_size, :]
-        image_path_batch = image_path[i * batch_size : (i + 1) * batch_size]
+        image_path_batch = image_paths[i * batch_size : (i + 1) * batch_size]
         yield src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch
     if instances_num > instances_num // batch_size * batch_size:
         src_text_batch = src_text[instances_num // batch_size * batch_size :, :]
         seg_text_batch = seg_text[instances_num // batch_size * batch_size :, :]
         tgt_batch = tgt[instances_num // batch_size * batch_size :, :]
         tgt_seg_batch = tgt_seg[instances_num // batch_size * batch_size :, :]
-        image_path_batch = image_path[instances_num // batch_size * batch_size :]
+        image_path_batch = image_paths[instances_num // batch_size * batch_size :]
         yield src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch
 
 
@@ -253,6 +253,10 @@ def read_dataset(args, path, split):
             if "image_path" in columns:  # Sentence-pair and images classification.
                 image_path = "/apdcephfs/share_1157269/janinezhao/data/llava/" + line[columns["image_path"]]
                 if imghdr.what(image_path) != 'jpeg' and imghdr.what(image_path) != 'png':
+                    continue
+                try:
+                    image = read_image(image_path, ImageReadMode.RGB)
+                except:
                     continue
             else: 
                 print("image_path is missing!")
@@ -359,19 +363,14 @@ def evaluate(args, dataset):
         src_image_batch = None
         flag = 0
         for j, image_path in enumerate(image_path_batch):
-            try:
-                image = read_image(image_path, ImageReadMode.RGB)
-                image = image.to(args.device)
-                src_image = transform(image)
-            except:
-                flag = 1
-                continue
+            image = read_image(image_path, ImageReadMode.RGB)
+            image = image.to(args.device)
+            src_image = transform(image)
+
             if src_image_batch is not None:
                 src_image_batch = torch.stack([src_image_batch,src_image])
             else:
                 src_image_batch = src_image
-        if flag == 1: # some images have problem
-            continue
         if len(src_image_batch.shape) == 3:
             src_image_batch = torch.unsqueeze(src_image_batch, 0)
         src_image_batch = src_image_batch.to(args.device).half()
@@ -429,7 +428,7 @@ def main():
     # from pyinstrument import Profiler
     # profiler = Profiler()
     # profiler.start()
-    args.logger.info("before load model")
+
     # Load or initialize parameters.
     if args.enable_zero3:
         with deepspeed.zero.Init(config_dict_or_path=args.deepspeed_config):
@@ -464,7 +463,7 @@ def main():
 
     # Training phase.
     trainset = read_dataset(args, args.train_path, split=True)[args.rank]
-    # random.shuffle(trainset) ### temp remove the random operation
+    random.shuffle(trainset)
     instances_num = len(trainset)
     batch_size = args.batch_size
     args.train_steps = int(instances_num * args.epochs_num / batch_size) + 1
@@ -490,7 +489,7 @@ def main():
     seg_text = torch.LongTensor([sample[1] for sample in trainset])
     tgt = torch.LongTensor([sample[2] for sample in trainset])
     tgt_seg = torch.LongTensor([sample[3] for sample in trainset])
-    image_path = [sample[4] for sample in trainset]
+    image_paths = [sample[4] for sample in trainset]
     length_before = torch.LongTensor([trainset[0][5]])
 
     total_loss, result, best_result, best_epoch = 0.0, 0.0, 0.0, 0
@@ -505,34 +504,23 @@ def main():
     for epoch in range(1, args.epochs_num + 1):
         model.train()
         for i, (src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch) in \
-enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_path)):
-            args.logger.info("Step: {}".format(i))
-            # if i == 24:
-            #     import pdb
-            #     pdb.set_trace()
+enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths)):
             src_image_batch = None
             flag = 0
             for j, image_path in enumerate(image_path_batch):
-                try:
-                    image = read_image(image_path, ImageReadMode.RGB)
-                    image = image.to(args.device)
-                    src_image = transform(image)
-                except:
-                    flag = 1
-                    continue
+                image = read_image(image_path, ImageReadMode.RGB)
+                image = image.to(args.device)
+                src_image = transform(image)
+
                 if src_image_batch is not None:
                     src_image_batch = torch.stack([src_image_batch,src_image])
                 else:
                     src_image_batch = src_image
 
-                args.logger.info("batch {} image path: {}".format(i, image_path))
-
-            if flag == 1:
+            if flag == 1 or src_image_batch == None:
                 continue
             if len(src_image_batch.shape) == 3:
                 src_image_batch = torch.unsqueeze(src_image_batch, 0)
-            # args.logger.info("src_image shape: {}".format(src_image.shape))
-            # args.logger.info("src_image_batch shape: {}".format(src_image_batch.shape))
             seg_image_batch = torch.ones(src_image_batch.shape[0],image_seg_length)
 
             loss, correct, denominator = train_model(args, model, optimizer, scheduler,
