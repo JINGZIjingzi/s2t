@@ -123,19 +123,22 @@ class LLaVa(nn.Module):
         """
         # Embedding.
         text_combine_emb = self.embedding(src_text, seg_text)
-
         if src_image is not None:
             image_embeds = self.vit_model(src_image, seg_image)
             image_embeds = self.connector(image_embeds)
         # Encoder.
         # assume text_before_image has the same length
-        emb_cat = torch.cat((text_combine_emb[:,:length_before[0],:], image_embeds, text_combine_emb[:,length_before[0]:,:]), 1)
+        if text_combine_emb.shape[0] == 1:
+            emb_cat = torch.cat((text_combine_emb[:,:length_before[0],:], image_embeds, text_combine_emb[:,length_before[0]:,:]), 1)
+        else:
+            emb_cat = torch.cat((text_combine_emb[0,:length_before[0],:], image_embeds[0], text_combine_emb[0,length_before[0]:,:]), 0).unsqueeze(0)
+            for i in range(1, text_combine_emb.shape[0]):
+                tmp = torch.cat((text_combine_emb[i,:length_before[i],:], image_embeds[i], text_combine_emb[i,length_before[i]:,:]), 0).unsqueeze(0)
+                emb_cat = torch.cat((emb_cat, tmp), 0)
         seg_cat = torch.cat((seg_image, seg_text), 1)
-
         if not self.remove_embedding_combine_layernorm:
             emb_cat = self.combine_layer_norm(emb_cat)
         # emb_cat = self.dropout(emb_cat)
-
         # encoder
         output = self.encoder(emb_cat, seg_cat)
         # Target.
@@ -188,7 +191,7 @@ def build_optimizer(args, model):
     return optimizer, scheduler
 
 
-def batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths):
+def batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths, length_before):
     instances_num = src_text.size()[0]
     for i in range(instances_num // batch_size):
         src_text_batch = src_text[i * batch_size : (i + 1) * batch_size, :]
@@ -196,14 +199,16 @@ def batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths):
         tgt_batch = tgt[i * batch_size : (i + 1) * batch_size, :]
         tgt_seg_batch = tgt_seg[i * batch_size : (i + 1) * batch_size, :]
         image_path_batch = image_paths[i * batch_size : (i + 1) * batch_size]
-        yield src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch
+        length_before_batch = length_before[i * batch_size : (i + 1) * batch_size]
+        yield src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch, length_before_batch
     if instances_num > instances_num // batch_size * batch_size:
         src_text_batch = src_text[instances_num // batch_size * batch_size :, :]
         seg_text_batch = seg_text[instances_num // batch_size * batch_size :, :]
         tgt_batch = tgt[instances_num // batch_size * batch_size :, :]
         tgt_seg_batch = tgt_seg[instances_num // batch_size * batch_size :, :]
         image_path_batch = image_paths[instances_num // batch_size * batch_size :]
-        yield src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch
+        length_before_batch = length_before[instances_num // batch_size * batch_size :]
+        yield src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch, length_before_batch
 
 
 def read_dataset(args, path, split):
@@ -217,6 +222,7 @@ def read_dataset(args, path, split):
     num_image_tokens = int(args.image_width / args.patch_size) * int(args.image_height / args.patch_size) + 1 # 336/14-14 --> 576 dim
     seq_text = args.seq_length - num_image_tokens # 576
     dataset, columns = [], {}
+
     if split:
         for i in range(args.world_size):
             dataset.append([])
@@ -229,16 +235,25 @@ def read_dataset(args, path, split):
                     columns[column_name] = i
                 continue
             line = line.rstrip("\r\n").split("\t")
-
             if args.prompt_template == "llama2":
                 prompt_overall = prompt_template["llama2"]
             elif args.prompt_template == "vicuna":
                 prompt_overall = prompt_template["vicuna"]
             else:
-                print("unsupported prompt template!")
+                args.logger.info("unsupported prompt template!")
                 continue
+            prompt = line[columns["prompt"]].replace("\\n","\n")
             prompt_before_image = prompt_overall + " USER:"
-            prompt_after_image = "\n" + line[columns["prompt"]].replace("\\n","\n") + "\nASSISTANT:"
+            prompt_after_image = "\nASSISTANT:"
+            if prompt[:7] == "<image>":
+                prompt_after_image = prompt[7:] + prompt_after_image
+            elif prompt[-7:] == "<image>":
+                prompt_before_image = prompt_before_image + prompt[:-7]
+            else:
+                prompt_after_image = "\n" + prompt + prompt_after_image
+
+            # args.logger.info("prompt_before_image: {}".format(prompt_before_image))
+            # args.logger.info("prompt_after_image: {}".format(prompt_after_image))
             prompt_before_image_id = args.tokenizer.convert_tokens_to_ids(
                 args.tokenizer.tokenize(prompt_before_image)
             )
@@ -248,10 +263,10 @@ def read_dataset(args, path, split):
             seg_before_image_id = [1] * len(prompt_before_image_id)
             seg_after_image_id = [1] * len(prompt_after_image_id)
             if len(prompt_before_image_id) + len(prompt_after_image_id) > seq_text:
-                print("promt too long, jump for now")
+                args.logger.info("promt too long, jump for now")
                 continue
             if "image_path" in columns:  # Sentence-pair and images classification.
-                image_path = "/apdcephfs/share_1157269/janinezhao/data/llava/" + line[columns["image_path"]]
+                image_path = "/apdcephfs_qy3/share_300998916/janinezhao/data/llava/" + line[columns["image_path"]]
                 if imghdr.what(image_path) != 'jpeg' and imghdr.what(image_path) != 'png':
                     continue
                 try:
@@ -259,7 +274,7 @@ def read_dataset(args, path, split):
                 except:
                     continue
             else: 
-                print("image_path is missing!")
+                args.logger.info("image_path is missing!")
                 continue
             tgt = line[columns["answer"]]
             tgt_id = args.tokenizer.convert_tokens_to_ids(
@@ -330,11 +345,12 @@ def train_model(args, model, optimizer, scheduler, src_text_batch, seg_text_batc
 
     loss, correct, denominator = model(src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, src_image_batch, seg_image_batch, length_before)
     if torch.cuda.device_count() > 1:
-        loss = torch.mean(loss)
+        loss = torch.mean(loss) / args.accumulation_steps
 
     model.backward(loss)
 
-    model.step()
+    if args.cur_step % args.accumulation_steps == 0:
+        model.step()
 
     return loss, correct, denominator
 
@@ -345,7 +361,8 @@ def evaluate(args, dataset):
     tgt = torch.LongTensor([sample[2] for sample in dataset])
     tgt_seg = torch.LongTensor([sample[3] for sample in dataset])
     image_paths = [sample[4] for sample in dataset]
-    length_before = torch.LongTensor([dataset[0][5]])
+    # length_before = torch.LongTensor([dataset[0][5]])
+    length_before = torch.LongTensor([sample[5] for sample in dataset])
     batch_size = args.batch_size
 
     transform = transforms.Compose([
@@ -358,31 +375,39 @@ def evaluate(args, dataset):
 
     args.model.eval()
 
-    for i, (src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch) in \
-    enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths)):
+    for i, (src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch, length_before_batch) in \
+    enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths, length_before)):
+        # args.logger.info("{}: evaluate: batch {} start".format(args.rank,i))
         src_image_batch = None
-        flag = 0
         for j, image_path in enumerate(image_path_batch):
             image = read_image(image_path, ImageReadMode.RGB)
             image = image.to(args.device)
             src_image = transform(image)
+            # args.logger.info("{}: evaluate: batch {} read image {}: {}".format(args.rank, i,j,image_path))
 
             if src_image_batch is not None:
                 src_image_batch = torch.stack([src_image_batch,src_image])
             else:
                 src_image_batch = src_image
+        if src_image_batch == None:
+            # args.logger.info("{} evaluate: batch {} src_image_batch is None!".format(args.rank, i))
+            continue
         if len(src_image_batch.shape) == 3:
             src_image_batch = torch.unsqueeze(src_image_batch, 0)
+        # args.logger.info("{} evaluate: batch {} prep data".format(args.rank, i))
         src_image_batch = src_image_batch.to(args.device).half()
         seg_image_batch = torch.ones(src_image_batch.shape[0],image_seg_length).to(args.device)
         src_text_batch = src_text_batch.to(args.device)
         seg_text_batch = seg_text_batch.to(args.device)
         tgt_batch = tgt_batch.to(args.device)
         tgt_seg_batch = tgt_seg_batch.to(args.device)
-        length_before = length_before.to(args.device)
+        length_before_batch = length_before_batch.to(args.device)
+        # args.logger.info("{} evaluate: batch {} infer start".format(args.rank, i))
+        # import pdb
+        # pdb.set_trace()
         with torch.no_grad():
-            _, correct_i, denominator_i = args.model(src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, src_image_batch, seg_image_batch, length_before)
-
+            _, correct_i, denominator_i = args.model(src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, src_image_batch, seg_image_batch, length_before_batch)
+            # args.logger.info("evaluate: batch {} infer done".format(i))
         correct += correct_i.item()
         denominator += denominator_i.item()
 
@@ -398,6 +423,8 @@ def main():
     tokenizer_opts(parser)
     parser.add_argument("--world_size", type=int, default=1,
                     help="Total number of processes (GPUs) for training.")
+    parser.add_argument("--accumulation_steps", type=int, default=1,
+                    help="Specific steps to accumulate gradient.")               
 
     parser.add_argument("--vit_model_path", type=str,
                         help="Pretrained model of Vit.")
@@ -437,8 +464,8 @@ def main():
                 model = _load_state_dict_into_model(model, args.pretrained_model_path)
             if args.vit_model_path is not None:
                 model.vit_model = _load_state_dict_into_model(model.vit_model, args.vit_model_path)
-            if args.qformer_model_path is not None:
-                model.qformer = _load_state_dict_into_model(model.qformer, args.qformer_model_path)
+            if args.connector_model_path is not None:
+                model.qformer = _load_state_dict_into_model(model.connector, args.connector_model_path)
     else:
         model = LLaVa(args)
         # Load or initialize parameters.
@@ -490,7 +517,8 @@ def main():
     tgt = torch.LongTensor([sample[2] for sample in trainset])
     tgt_seg = torch.LongTensor([sample[3] for sample in trainset])
     image_paths = [sample[4] for sample in trainset]
-    length_before = torch.LongTensor([trainset[0][5]])
+    # length_before = torch.LongTensor([trainset[0][5]])
+    length_before = torch.LongTensor([sample[5] for sample in trainset])
 
     total_loss, result, best_result, best_epoch = 0.0, 0.0, 0.0, 0
     total_correct, total_denominator = 0.0, 0
@@ -501,12 +529,12 @@ def main():
         args.logger.info("The number of training instances: {}".format(instances_num))
         args.logger.info("Start training.")
 
+    args.cur_step = 0
     for epoch in range(1, args.epochs_num + 1):
         model.train()
-        for i, (src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch) in \
-enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths)):
+        for i, (src_text_batch, seg_text_batch, tgt_batch, tgt_seg_batch, image_path_batch, length_before_batch) in \
+enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths, length_before)):
             src_image_batch = None
-            flag = 0
             for j, image_path in enumerate(image_path_batch):
                 image = read_image(image_path, ImageReadMode.RGB)
                 image = image.to(args.device)
@@ -517,7 +545,7 @@ enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths
                 else:
                     src_image_batch = src_image
 
-            if flag == 1 or src_image_batch == None:
+            if src_image_batch == None:
                 continue
             if len(src_image_batch.shape) == 3:
                 src_image_batch = torch.unsqueeze(src_image_batch, 0)
@@ -525,7 +553,9 @@ enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths
 
             loss, correct, denominator = train_model(args, model, optimizer, scheduler,
                 src_text_batch, seg_text_batch,
-                tgt_batch, tgt_seg_batch, src_image_batch, seg_image_batch, length_before)
+                tgt_batch, tgt_seg_batch, src_image_batch, seg_image_batch, length_before_batch)
+            args.cur_step += 1
+
             total_loss += loss.item()
             total_correct += correct.item()
             total_denominator += denominator.item()
@@ -534,15 +564,19 @@ enumerate(batch_loader(batch_size, src_text, seg_text, tgt, tgt_seg, image_paths
                 total_loss = 0.0
                 total_correct, total_denominator = 0.0, 0
             if (i + 1) % args.save_steps == 0:
-                if args.rank == 0:
+                if args.stage == "finetune" or (args.stage == "pretrain" and args.rank == 0):
                     result = evaluate(args, read_dataset(args, args.dev_path, split=False))
+                    model.train()
                     result_tensor = torch.tensor(result).to(args.device)
                 dist.broadcast(result_tensor, 0, async_op=False)
                 model.save_checkpoint(args.output_model_path+"-"+str(i+1), str(epoch))
-
-        if args.rank == 0:
+        args.logger.info("Epoch: {} done in rank: {}".format(epoch, args.rank))
+        if args.stage == "finetune" or (args.stage == "pretrain" and args.rank == 0):
+            args.logger.info("begin evaluate in rank: {}".format(args.rank))
             result = evaluate(args, read_dataset(args, args.dev_path, split=False))
+            args.logger.info("evaluate done in rank: {}".format(args.rank))
             result_tensor = torch.tensor(result).to(args.device)
+
         dist.broadcast(result_tensor, 0, async_op=False)
         if result_tensor.float() >= best_result:
             best_result = result_tensor.float().item()
